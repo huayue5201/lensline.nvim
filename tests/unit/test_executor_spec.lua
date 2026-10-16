@@ -255,4 +255,37 @@ describe("executor core behaviors", function()
       end)
     end)
   end)
+
+  it("refreshes attached buffers when an indexing progress ends", function()
+    local bufnr = make_buf({ "a" })
+    local refreshed = {}
+    local original = vim.lsp.get_client_by_id
+    vim.lsp.get_client_by_id = function(id)
+      if id == 42 then
+        return { attached_buffers = { [bufnr] = true } }
+      end
+      return original(id)
+    end
+
+    local executor = require("lensline.executor")
+    executor.setup_readiness_listeners()
+    executor.trigger_unified_update = function(b)
+      refreshed[b] = true
+    end
+
+    vim.api.nvim_exec_autocmds("LspProgress", {
+      pattern = "end",
+      data = { client_id = 42, params = { token = "rustAnalyzer/Indexing", value = { kind = "end" } } },
+    })
+    assert.is_true(refreshed[bufnr] == true, "should refresh attached buffer on indexing progress end")
+
+    refreshed = {}
+    vim.api.nvim_exec_autocmds("LspProgress", {
+      pattern = "end",
+      data = { client_id = 42, params = { token = "other/progress", value = { kind = "end" } } },
+    })
+    assert.is_nil(refreshed[bufnr], "should ignore non-indexing progress")
+
+    vim.lsp.get_client_by_id = original
+  end)
 end)

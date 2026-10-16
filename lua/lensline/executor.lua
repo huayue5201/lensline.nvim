@@ -10,6 +10,10 @@ local unified_debounce_timer = {}
 -- Track execution state to prevent cascading/recursive calls
 local execution_in_progress = {}
 
+-- Track LSP readiness refresh state (see M.setup_readiness_listeners)
+local readiness_group = nil
+local readiness_timer = {}
+
 -- Event listeners setup
 local event_listeners = {}
 
@@ -54,6 +58,135 @@ function M.setup_event_listeners()
         M.trigger_unified_update(args.buf)
       end,
     })
+  end
+end
+
+-- ============================================================
+-- LSP readiness refresh
+--
+-- The first provider run (triggered on BufReadPost/LspAttach) can happen
+-- before the LSP server has finished indexing the project. Providers then
+-- get empty/zero results (e.g. "0 refs") and the plugin never re-runs them
+-- until the next edit/save — so counts look wrong on a freshly opened file.
+--
+-- These listeners re-run providers once a client is ready: for servers that
+-- report indexing progress (rust-analyzer's `rustAnalyzer/Indexing`) we react
+-- to the progress-end event; for everyone else we poll until the client is
+-- `initialized` and then refresh after a short grace period.
+-- ============================================================
+local function get_clients(bufnr)
+  if vim.lsp.get_clients then
+    return vim.lsp.get_clients({ bufnr = bufnr })
+  end
+  return vim.lsp.get_active_clients({ bufnr = bufnr })
+end
+
+local function cancel_readiness_timer(bufnr)
+  local timer = readiness_timer[bufnr]
+  if timer then
+    if not timer:is_closing() then
+      timer:stop()
+      timer:close()
+    end
+    readiness_timer[bufnr] = nil
+  end
+end
+
+-- Refresh `bufnr` once the server looks ready (or after a timeout fallback).
+local function schedule_readiness_refresh(bufnr)
+  if not utils.is_valid_buffer(bufnr) or readiness_timer[bufnr] then
+    return
+  end
+  local elapsed = 0
+  local interval = 300
+  local timeout_ms = 15000
+  local grace_ms = 1500
+  local timer = vim.loop.new_timer()
+  readiness_timer[bufnr] = timer
+  timer:start(interval, interval, vim.schedule_wrap(function()
+    if readiness_timer[bufnr] ~= timer then
+      return
+    end
+    if not utils.is_valid_buffer(bufnr) then
+      cancel_readiness_timer(bufnr)
+      return
+    end
+    elapsed = elapsed + interval
+    local ready = false
+    for _, client in ipairs(get_clients(bufnr)) do
+      if client.initialized then
+        ready = true
+        break
+      end
+    end
+    if ready or elapsed >= timeout_ms then
+      cancel_readiness_timer(bufnr)
+      vim.defer_fn(function()
+        if utils.is_valid_buffer(bufnr) then
+          M.trigger_unified_update(bufnr)
+        end
+      end, ready and grace_ms or 0)
+    end
+  end))
+end
+
+-- Authoritative signal: refresh every buffer attached to the client that just
+-- finished an indexing progress report.
+local function refresh_buffers_for_client(client_id)
+  local client = vim.lsp.get_client_by_id and vim.lsp.get_client_by_id(client_id)
+  if not client then
+    return
+  end
+  for bufnr in pairs(client.attached_buffers or {}) do
+    if utils.is_valid_buffer(bufnr) then
+      M.trigger_unified_update(bufnr)
+    end
+  end
+end
+
+function M.setup_readiness_listeners()
+  if readiness_group then
+    vim.api.nvim_del_augroup_by_id(readiness_group)
+  end
+  readiness_group = vim.api.nvim_create_augroup("lensline_lsp_readiness", { clear = true })
+
+  vim.api.nvim_create_autocmd("LspAttach", {
+    group = readiness_group,
+    callback = function(args)
+      schedule_readiness_refresh(args.buf)
+    end,
+  })
+
+  vim.api.nvim_create_autocmd("LspProgress", {
+    group = readiness_group,
+    callback = function(args)
+      local data = args.data or {}
+      local params = data.params or {}
+      local value = params.value or {}
+      if value.kind ~= "end" then
+        return
+      end
+      local token = tostring(params.token or value.title or "")
+      if not token:lower():find("index") then
+        return
+      end
+      refresh_buffers_for_client(data.client_id)
+    end,
+  })
+
+  vim.api.nvim_create_autocmd("LspDetach", {
+    group = readiness_group,
+    callback = function(args)
+      cancel_readiness_timer(args.buf)
+    end,
+  })
+
+  -- The plugin may load on LspAttach, after that event already fired for the
+  -- buffers that triggered it — cover buffers that already have clients.
+  for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_loaded(bufnr) and #get_clients(bufnr) > 0 then
+      schedule_readiness_refresh(bufnr)
+    end
   end
 end
 
@@ -356,6 +489,15 @@ function M.cleanup()
   
   -- Clean up function discovery cache from lens_explorer
   lens_explorer.cleanup_cache()
+
+  -- Clean up LSP readiness listeners/timers
+  if readiness_group then
+    vim.api.nvim_del_augroup_by_id(readiness_group)
+    readiness_group = nil
+  end
+  for bufnr in pairs(readiness_timer) do
+    cancel_readiness_timer(bufnr)
+  end
 end
 
 return M

@@ -26,6 +26,9 @@ function M.initialize()
   
   -- Setup provider event listeners via executor
   executor.setup_event_listeners()
+
+  -- Re-run providers once LSP clients are ready (fixes zero counts on first open)
+  executor.setup_readiness_listeners()
   
   -- Setup render mode (focused vs all)
   if config.get_render_mode() == "focused" then
